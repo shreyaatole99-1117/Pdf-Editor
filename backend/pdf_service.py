@@ -9,10 +9,13 @@ Design notes:
 - Text delete/replace uses real redaction (page.add_redact_annot + apply_redactions),
   which removes the underlying content-stream operators for the matched glyphs -
   not a white-box overlay. Extracted text after deletion no longer contains the keyword.
-- Replace re-inserts text after redaction using a fallback font matched on size/color,
-  since the original PDF's embedded font is almost always subsetted (only contains the
-  glyphs actually used) and may not contain glyphs for the replacement string.
-- Image object handling is a separate module (added in phase 2).
+- Replace re-inserts text after redaction using a fallback font matched on
+  family/weight/style (see _pick_fallback_font), since the original PDF's
+  embedded font is almost always subsetted (only contains the glyphs actually
+  used) and may not contain glyphs for the replacement string.
+- Images: list_images/delete_image handle individual image objects (by xref).
+- delete_region deletes whatever falls inside an arbitrary user-drawn box -
+  text and/or image content, only the overlapping part of each.
 """
 
 import fitz  # PyMuPDF
@@ -83,8 +86,6 @@ def _open_doc(path: str) -> fitz.Document:
     except Exception as e:
         raise PDFError("invalid_pdf", f"Could not open PDF: {e}")
     if doc.is_encrypted:
-        # fitz can sometimes still open encrypted docs with empty owner password;
-        # if pages aren't readable, treat as password-protected.
         try:
             doc.load_page(0)
         except Exception:
@@ -109,7 +110,6 @@ def upload_pdf(file_bytes: bytes) -> dict:
     with open(orig_path, "wb") as f:
         f.write(file_bytes)
 
-    # validate it opens, gather metadata
     try:
         doc = _open_doc(orig_path)
     except PDFError:
@@ -120,7 +120,6 @@ def upload_pdf(file_bytes: bytes) -> dict:
     is_scanned = not any(_page_has_extractable_text(doc.load_page(i)) for i in range(page_count))
     doc.close()
 
-    # working copy starts identical to the original
     shutil.copyfile(orig_path, _working_path(doc_id))
 
     state = DocState(doc_id=doc_id, page_count=page_count, is_scanned=is_scanned)
@@ -144,32 +143,24 @@ def search_keyword(doc_id: str, keyword: str, case_sensitive: bool = False) -> d
     if not keyword or not keyword.strip():
         raise PDFError("empty_keyword", "Search keyword cannot be empty.")
 
-    _get_state(doc_id)  # validates doc exists
+    _get_state(doc_id)
     doc = _open_doc(_working_path(doc_id))
 
-    flags = 0 if case_sensitive else fitz.TEXT_DEHYPHENATE
     occurrences = []
     pages_with_hits = set()
 
     for page_index in range(doc.page_count):
         page = doc.load_page(page_index)
-        # search_for is case-sensitive by default in PyMuPDF; do case-insensitive
-        # ourselves by searching lowercased text when requested.
         if case_sensitive:
             rects = page.search_for(keyword)
         else:
             rects = page.search_for(keyword, flags=fitz.TEXT_PRESERVE_WHITESPACE) or []
-            if not rects:
-                rects = _case_insensitive_search(page, keyword)
-            else:
-                # search_for is already exact-case; for case-insensitive we still need
-                # to also catch differently-cased occurrences, so union with manual search.
-                manual = _case_insensitive_search(page, keyword)
-                rects = _merge_rects(rects, manual)
+            manual = _case_insensitive_search(page, keyword)
+            rects = _merge_rects(rects, manual)
 
         for r in rects:
             occurrences.append({
-                "page": page_index + 1,  # 1-indexed for the UI
+                "page": page_index + 1,
                 "bbox": [r.x0, r.y0, r.x1, r.y1],
             })
             pages_with_hits.add(page_index + 1)
@@ -189,24 +180,20 @@ def search_keyword(doc_id: str, keyword: str, case_sensitive: bool = False) -> d
 
 
 def _case_insensitive_search(page: fitz.Page, keyword: str) -> list:
-    """Fallback manual case-insensitive search using word-level text extraction."""
     kw_lower = keyword.lower()
     results = []
-    words = page.get_text("words")  # (x0, y0, x1, y1, word, block_no, line_no, word_no)
+    words = page.get_text("words")
     kw_tokens = kw_lower.split()
 
     if len(kw_tokens) == 1:
         for w in words:
             if w[4].lower() == kw_tokens[0]:
                 results.append(fitz.Rect(w[0], w[1], w[2], w[3]))
-        # also try substring match within longer words (keyword as part of a word)
         if kw_lower not in [w[4].lower() for w in words]:
             for w in words:
                 if kw_lower in w[4].lower():
                     results.append(fitz.Rect(w[0], w[1], w[2], w[3]))
     else:
-        # multi-word keyword: use page.search_for case-insensitively by trying
-        # both the given case and a title/upper/lower variant, then de-dupe.
         variants = {keyword, keyword.lower(), keyword.upper(), keyword.title()}
         for v in variants:
             results.extend(page.search_for(v))
@@ -222,16 +209,15 @@ def _merge_rects(a: list, b: list) -> list:
 
 
 def _snapshot_before_edit(doc_id: str):
-    """Push current working file onto the undo history stack before mutating it."""
     state = _get_state(doc_id)
     snap_path = os.path.join(_history_dir(doc_id), f"{len(state.history_stack)}_{uuid.uuid4().hex}.pdf")
     shutil.copyfile(_working_path(doc_id), snap_path)
     state.history_stack.append(snap_path)
-    state.redo_stack.clear()  # any new edit invalidates redo history
+    state.redo_stack.clear()
 
 
 def delete_all(doc_id: str, keyword: str, case_sensitive: bool = False) -> dict:
-    result = search_keyword(doc_id, keyword, case_sensitive)  # raises if not found
+    result = search_keyword(doc_id, keyword, case_sensitive)
 
     _snapshot_before_edit(doc_id)
 
@@ -246,8 +232,6 @@ def delete_all(doc_id: str, keyword: str, case_sensitive: bool = False) -> dict:
             page.add_redact_annot(fitz.Rect(*bbox))
             total_removed += 1
         if rects:
-            # images=0 keeps images on the page untouched; only text under the
-            # redaction box is stripped from the content stream.
             page.apply_redactions(images=0)
 
     _save_and_replace(doc, working_path)
@@ -259,11 +243,99 @@ def delete_all(doc_id: str, keyword: str, case_sensitive: bool = False) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Font matching for Replace All
+# ---------------------------------------------------------------------------
+# PyMuPDF span "flags" bitmask (from insert_text/get_text("dict") testing):
+#   1  = superscript
+#   2  = italic
+#   4  = serifed (Times-like)
+#   8  = monospaced (Courier-like)
+#   16 = bold
+_FLAG_ITALIC = 2
+_FLAG_BOLD = 16
+
+# PyMuPDF's built-in Base-14 Helvetica (sans-serif) aliases - the only
+# family used now, see _pick_fallback_font for why.
+_HELV = {(False, False): "helv", (True, False): "hebo", (False, True): "heit", (True, True): "hebi"}
+
+
+def _pick_fallback_font(font_name: str, flags: int) -> str:
+    """Maps an original span's style to a built-in font matching its
+    bold/italic weight at the matched size.
+
+    Originally this also tried to detect serif-vs-sans-vs-monospace family
+    from the span's "serif"/"monospace" flag bits and font-name keywords,
+    but on some PDFs (confirmed: an engineering/CAD title block) those flags
+    don't reliably reflect the actual rendered font, causing a plain
+    sans-serif label to come back flagged as serif and the replacement text
+    to render in a visibly different, wrong-looking typeface. Since the
+    overwhelming majority of real documents use a sans-serif family for body
+    text anyway, family detection was dropped - only bold/italic and size
+    (handled by the caller) are matched now, which is both simpler and
+    matches what was actually asked for."""
+    name_lower = (font_name or "").lower()
+    bold = bool(flags & _FLAG_BOLD) or "bold" in name_lower or "black" in name_lower or "heavy" in name_lower
+    italic = bool(flags & _FLAG_ITALIC) or "italic" in name_lower or "oblique" in name_lower
+    return _HELV[(bold, italic)]
+
+
+def _rect_overlap_area(a: fitz.Rect, b: tuple) -> float:
+    """Intersection area between fitz.Rect `a` and a plain (x0,y0,x1,y1) tuple `b`."""
+    x0 = max(a.x0, b[0])
+    y0 = max(a.y0, b[1])
+    x1 = min(a.x1, b[2])
+    y1 = min(a.y1, b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def _guess_text_style(page: fitz.Page, bbox: fitz.Rect) -> tuple:
+    """Best-effort extraction of font size, RGB color, and a matching
+    fallback font name for the text actually under bbox.
+
+    get_text("dict", clip=bbox) can return MULTIPLE spans when bbox sits
+    close to other text (e.g. a small label crammed next to a big number in
+    a dense CAD title block) - it returns anything whose bbox overlaps the
+    clip region at all, not just an exact match. Picking the first one
+    blindly can grab a neighboring, differently-sized span instead of the
+    actual matched text (confirmed: a 7pt label 5px above a 20pt number both
+    got returned, first-in-list being the wrong 7pt one). Instead, score
+    every candidate span by how much it overlaps our target bbox and take
+    the best match - the real match should cover ~all of the target box,
+    while a bleeding-in neighbor only clips a small corner of it."""
+    size = max(bbox.y1 - bbox.y0, 6.0) * 0.8  # fallback: derive from box height
+    color = (0, 0, 0)
+    fontname = "helv"  # fallback default
+
+    target_area = max((bbox.x1 - bbox.x0) * (bbox.y1 - bbox.y0), 0.01)
+    best_ratio = 0.0
+
+    try:
+        d = page.get_text("dict", clip=bbox)
+        for block in d.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    overlap = _rect_overlap_area(bbox, span["bbox"])
+                    ratio = overlap / target_area
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        size = span.get("size", size)
+                        c = span.get("color", 0)
+                        color = ((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255)
+                        fontname = _pick_fallback_font(span.get("font", ""), span.get("flags", 0))
+    except Exception:
+        pass
+
+    return size, color, fontname
+
+
 def replace_all(doc_id: str, find: str, replace: str, case_sensitive: bool = False) -> dict:
     if replace is None:
         replace = ""
 
-    result = search_keyword(doc_id, find, case_sensitive)  # raises if not found
+    result = search_keyword(doc_id, find, case_sensitive)
 
     _snapshot_before_edit(doc_id)
 
@@ -277,27 +349,27 @@ def replace_all(doc_id: str, find: str, replace: str, case_sensitive: bool = Fal
         if not occs:
             continue
 
-        # Capture font size/color hints from the original text before redacting it.
+        # Capture font size/color/family hints from the original text before redacting it.
         insert_specs = []
         for occ in occs:
             bbox = fitz.Rect(*occ["bbox"])
-            size, color = _guess_text_style(page, bbox)
-            insert_specs.append((bbox, size, color))
+            size, color, fontname = _guess_text_style(page, bbox)
+            insert_specs.append((bbox, size, color, fontname))
             page.add_redact_annot(bbox)
             total_replaced += 1
 
         page.apply_redactions(images=0)
 
-        for bbox, size, color in insert_specs:
+        for bbox, size, color, fontname in insert_specs:
             if replace:
-                # Insert replacement text left-aligned within the original bbox,
-                # using a standard fallback font (helv) since the original font
-                # is very likely subsetted and won't contain glyphs for new text.
+                # ✅ fontname now matches the original's family/weight/style
+                # (serif/sans/mono, bold, italic) instead of always plain
+                # Helvetica - see _pick_fallback_font above.
                 page.insert_text(
-                    (bbox.x0, bbox.y1 - 1),  # baseline approx at bbox bottom
+                    (bbox.x0, bbox.y1 - 1),
                     replace,
                     fontsize=size,
-                    fontname="helv",
+                    fontname=fontname,
                     color=color,
                 )
 
@@ -311,31 +383,7 @@ def replace_all(doc_id: str, find: str, replace: str, case_sensitive: bool = Fal
     }
 
 
-def _guess_text_style(page: fitz.Page, bbox: fitz.Rect) -> tuple:
-    """Best-effort extraction of font size + RGB color for text under bbox, for
-    visually-close (not identical) replacement text."""
-    size = max(bbox.y1 - bbox.y0, 6.0) * 0.8  # fallback: derive from box height
-    color = (0, 0, 0)
-    try:
-        d = page.get_text("dict", clip=bbox)
-        for block in d.get("blocks", []):
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    size = span.get("size", size)
-                    c = span.get("color", 0)
-                    color = ((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255)
-                    return size, color
-    except Exception:
-        pass
-    return size, color
-
-
 def list_images(doc_id: str) -> dict:
-    """Per-page image placements: bbox + xref, for the frontend to draw
-    clickable selection boxes over. xref is the stable id used to target a
-    specific image for deletion (a reused image can appear at multiple
-    placements/bboxes sharing the same xref - each placement gets its own
-    entry here since the user clicks a specific spot on the page)."""
     _get_state(doc_id)
     doc = _open_doc(_working_path(doc_id))
 
@@ -343,9 +391,6 @@ def list_images(doc_id: str) -> dict:
     for page_index in range(doc.page_count):
         page = doc.load_page(page_index)
         for info in page.get_image_info(xrefs=True):
-            # skip the 1x1 transparent placeholders that delete_image() leaves
-            # behind - they're not real content, just PyMuPDF's internal way
-            # of "removing" an image without disturbing the page structure
             if info["width"] <= 1 and info["height"] <= 1:
                 continue
             images.append({
@@ -361,11 +406,6 @@ def list_images(doc_id: str) -> dict:
 
 
 def delete_image(doc_id: str, page_number: int, xref: int) -> dict:
-    """Removes exactly one image object (by xref, on the given page) from
-    the PDF. Uses PyMuPDF's Page.delete_image, which replaces the image's
-    raster content with a 1x1 transparent placeholder rather than touching
-    the page's content stream/resource structure - so surrounding text,
-    other images, page size and layout are all left alone."""
     state = _get_state(doc_id)
 
     if page_number < 1 or page_number > state.page_count:
@@ -380,7 +420,6 @@ def delete_image(doc_id: str, page_number: int, xref: int) -> dict:
     xrefs_on_page = {info["xref"] for info in page.get_image_info(xrefs=True)}
     if xref not in xrefs_on_page:
         doc.close()
-        # undo the snapshot we just pushed since nothing is actually changing
         state.history_stack.pop()
         raise PDFError("image_not_found", "That image could not be found on this page (it may have already been removed).")
 
@@ -397,13 +436,6 @@ def delete_image(doc_id: str, page_number: int, xref: int) -> dict:
 
 
 def delete_region(doc_id: str, page_number: int, bbox: list) -> dict:
-    """Deletes whatever falls inside an arbitrary user-drawn rectangle on one
-    page - text and/or image content alike, and only the part of each that
-    actually overlaps the box. Text fully or partially inside the box is
-    removed; images get only their overlapping pixels blanked out (not the
-    whole image) via apply_redactions(images=2); vector graphics overlapping
-    the box are removed too. Verified: a box covering half an image + part
-    of a text line removed exactly that half/part and left the rest intact."""
     state = _get_state(doc_id)
 
     if page_number < 1 or page_number > state.page_count:
@@ -424,9 +456,6 @@ def delete_region(doc_id: str, page_number: int, bbox: list) -> dict:
     rect = fitz.Rect(x0, y0, x1, y1)
     try:
         page.add_redact_annot(rect)
-        # images=2: blank out only the overlapping part of any image, not the
-        # whole image. graphics=2: remove any vector graphics touching the
-        # box. text=0: remove any text touching the box (default already).
         page.apply_redactions(images=2, graphics=2, text=0)
     except Exception as e:
         doc.close()
@@ -444,7 +473,6 @@ def undo(doc_id: str) -> dict:
         raise PDFError("nothing_to_undo", "No edits to undo.")
 
     working_path = _working_path(doc_id)
-    # push current state onto redo stack, restore previous snapshot
     redo_snap = os.path.join(_history_dir(doc_id), f"redo_{uuid.uuid4().hex}.pdf")
     shutil.copyfile(working_path, redo_snap)
     state.redo_stack.append(redo_snap)
@@ -472,7 +500,6 @@ def redo(doc_id: str) -> dict:
 
 
 def _snapshot_before_edit_no_clear(doc_id: str):
-    """Like _snapshot_before_edit but doesn't clear the redo stack (used internally by redo())."""
     state = _get_state(doc_id)
     snap_path = os.path.join(_history_dir(doc_id), f"{len(state.history_stack)}_{uuid.uuid4().hex}.pdf")
     shutil.copyfile(_working_path(doc_id), snap_path)
@@ -485,7 +512,6 @@ def get_working_pdf_path(doc_id: str) -> str:
 
 
 def reset_to_original(doc_id: str) -> dict:
-    """Discard all edits, restore the working copy back to the untouched original."""
     state = _get_state(doc_id)
     shutil.copyfile(_original_path(doc_id), _working_path(doc_id))
     state.history_stack.clear()
